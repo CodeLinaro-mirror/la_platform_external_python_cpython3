@@ -196,12 +196,12 @@ PyPreConfig
 
    Function to initialize a preconfiguration:
 
-   .. c:function:: void PyPreConfig_InitIsolatedConfig(PyPreConfig *preconfig)
+   .. c:function:: void PyPreConfig_InitPythonConfig(PyPreConfig *preconfig)
 
       Initialize the preconfiguration with :ref:`Python Configuration
       <init-python-config>`.
 
-   .. c:function:: void PyPreConfig_InitPythonConfig(PyPreConfig *preconfig)
+   .. c:function:: void PyPreConfig_InitIsolatedConfig(PyPreConfig *preconfig)
 
       Initialize the preconfiguration with :ref:`Isolated Configuration
       <init-isolated-conf>`.
@@ -757,7 +757,7 @@ configuration, and then override some parameters::
         PyConfig config;
         PyConfig_InitPythonConfig(&config);
 
-        /* Set the program name before reading the configuraton
+        /* Set the program name before reading the configuration
            (decode byte string from the locale encoding).
 
            Implicitly preinitialize Python. */

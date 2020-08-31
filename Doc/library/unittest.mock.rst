@@ -647,6 +647,9 @@ the *new_callable* argument to :func:`patch`.
         arguments and make more complex assertions. See
         :ref:`calls as tuples <calls-as-tuples>`.
 
+        .. versionchanged:: 3.8
+           Added ``args`` and ``kwargs`` properties.
+
 
     .. attribute:: call_args_list
 
@@ -915,6 +918,7 @@ object::
   >>> mock.async_foo
   <AsyncMock name='mock.async_foo' id='...'>
 
+  .. versionadded:: 3.8
 
   .. method:: assert_awaited()
 

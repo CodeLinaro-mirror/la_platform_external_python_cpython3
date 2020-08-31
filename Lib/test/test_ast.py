@@ -140,6 +140,8 @@ exec_tests = [
     "@deco1\n@deco2()\n@deco3(1)\nclass C: pass",
     # Decorator with generator argument
     "@deco(a for a in b)\ndef f(): pass",
+    # Decorator with attribute
+    "@a.b.c\ndef f(): pass",
     # Simple assignment expression
     "(a := 1)",
     # Positional-only arguments
@@ -385,6 +387,15 @@ class AST_Tests(unittest.TestCase):
         self.assertRaises(TypeError, ast.Num, 1, None, 2)
         self.assertRaises(TypeError, ast.Num, 1, None, 2, lineno=0)
 
+        # Arbitrary keyword arguments are supported
+        self.assertEqual(ast.Constant(1, foo='bar').foo, 'bar')
+        self.assertEqual(ast.Num(1, foo='bar').foo, 'bar')
+
+        with self.assertRaisesRegex(TypeError, "Num got multiple values for argument 'n'"):
+            ast.Num(1, n=2)
+        with self.assertRaisesRegex(TypeError, "Constant got multiple values for argument 'value'"):
+            ast.Constant(1, value=2)
+
         self.assertEqual(ast.Num(42).n, 42)
         self.assertEqual(ast.Num(4.25).n, 4.25)
         self.assertEqual(ast.Num(4.25j).n, 4.25j)
@@ -613,6 +624,24 @@ class AST_Tests(unittest.TestCase):
         self.assertEqual(grandchild_binop.lineno, 1)
         self.assertEqual(grandchild_binop.end_col_offset, 3)
         self.assertEqual(grandchild_binop.end_lineno, 1)
+
+    def test_issue39579_dotted_name_end_col_offset(self):
+        tree = ast.parse('@a.b.c\ndef f(): pass')
+        attr_b = tree.body[0].decorator_list[0].value
+        self.assertEqual(attr_b.end_col_offset, 4)
+
+    def test_issue40614_feature_version(self):
+        ast.parse('f"{x=}"', feature_version=(3, 8))
+        with self.assertRaises(SyntaxError):
+            ast.parse('f"{x=}"', feature_version=(3, 7))
+
+    def test_constant_as_name(self):
+        for constant in "True", "False", "None":
+            expr = ast.Expression(ast.Name(constant, ast.Load()))
+            ast.fix_missing_locations(expr)
+            with self.assertRaisesRegex(ValueError, f"Name node can't be used with '{constant}' constant"):
+                compile(expr, "<test>", "eval")
+
 
 class ASTHelpers_Test(unittest.TestCase):
     maxDiff = None
@@ -861,6 +890,12 @@ class ASTHelpers_Test(unittest.TestCase):
         self.assertRaises(ValueError, ast.literal_eval, '3+-6j')
         self.assertRaises(ValueError, ast.literal_eval, '3+(0+6j)')
         self.assertRaises(ValueError, ast.literal_eval, '-(3+6j)')
+
+    def test_literal_eval_malformed_dict_nodes(self):
+        malformed = ast.Dict(keys=[ast.Constant(1), ast.Constant(2)], values=[ast.Constant(3)])
+        self.assertRaises(ValueError, ast.literal_eval, malformed)
+        malformed = ast.Dict(keys=[ast.Constant(1)], values=[ast.Constant(2), ast.Constant(3)])
+        self.assertRaises(ValueError, ast.literal_eval, malformed)
 
     def test_bad_integer(self):
         # issue13436: Bad error message with invalid numeric values
@@ -1635,6 +1670,33 @@ class EndPositionTests(unittest.TestCase):
         self._check_content(s, call, s)
         self._check_content(s, call.args[0], 'x. y .z')
 
+    def test_redundant_parenthesis(self):
+        s = '( ( ( a + b ) ) )'
+        v = ast.parse(s).body[0].value
+        self.assertEqual(type(v).__name__, 'BinOp')
+        self._check_content(s, v, 'a + b')
+        s2 = 'await ' + s
+        v = ast.parse(s2).body[0].value.value
+        self.assertEqual(type(v).__name__, 'BinOp')
+        self._check_content(s2, v, 'a + b')
+
+    def test_trailers_with_redundant_parenthesis(self):
+        tests = (
+            ('( ( ( a ) ) ) ( )', 'Call'),
+            ('( ( ( a ) ) ) ( b )', 'Call'),
+            ('( ( ( a ) ) ) [ b ]', 'Subscript'),
+            ('( ( ( a ) ) ) . b', 'Attribute'),
+        )
+        for s, t in tests:
+            with self.subTest(s):
+                v = ast.parse(s).body[0].value
+                self.assertEqual(type(v).__name__, t)
+                self._check_content(s, v, s)
+                s2 = 'await ' + s
+                v = ast.parse(s2).body[0].value.value
+                self.assertEqual(type(v).__name__, t)
+                self._check_content(s2, v, s)
+
     def test_displays(self):
         s1 = '[{}, {1, }, {1, 2,} ]'
         s2 = '{a: b, f (): g () ,}'
@@ -1838,6 +1900,7 @@ exec_results = [
 ('Module', [('AsyncFunctionDef', (4, 0), 'f', ('arguments', [], [], None, [], [], None, []), [('Pass', (4, 15))], [('Name', (1, 1), 'deco1', ('Load',)), ('Call', (2, 1), ('Name', (2, 1), 'deco2', ('Load',)), [], []), ('Call', (3, 1), ('Name', (3, 1), 'deco3', ('Load',)), [('Constant', (3, 7), 1, None)], [])], None, None)], []),
 ('Module', [('ClassDef', (4, 0), 'C', [], [], [('Pass', (4, 9))], [('Name', (1, 1), 'deco1', ('Load',)), ('Call', (2, 1), ('Name', (2, 1), 'deco2', ('Load',)), [], []), ('Call', (3, 1), ('Name', (3, 1), 'deco3', ('Load',)), [('Constant', (3, 7), 1, None)], [])])], []),
 ('Module', [('FunctionDef', (2, 0), 'f', ('arguments', [], [], None, [], [], None, []), [('Pass', (2, 9))], [('Call', (1, 1), ('Name', (1, 1), 'deco', ('Load',)), [('GeneratorExp', (1, 5), ('Name', (1, 6), 'a', ('Load',)), [('comprehension', ('Name', (1, 12), 'a', ('Store',)), ('Name', (1, 17), 'b', ('Load',)), [], 0)])], [])], None, None)], []),
+('Module', [('FunctionDef', (2, 0), 'f', ('arguments', [], [], None, [], [], None, []), [('Pass', (2, 9))], [('Attribute', (1, 1), ('Attribute', (1, 1), ('Name', (1, 1), 'a', ('Load',)), 'b', ('Load',)), 'c', ('Load',))], None, None)], []),
 ('Module', [('Expr', (1, 0), ('NamedExpr', (1, 1), ('Name', (1, 1), 'a', ('Store',)), ('Constant', (1, 6), 1, None)))], []),
 ('Module', [('FunctionDef', (1, 0), 'f', ('arguments', [('arg', (1, 6), 'a', None, None)], [], None, [], [], None, []), [('Pass', (1, 14))], [], None, None)], []),
 ('Module', [('FunctionDef', (1, 0), 'f', ('arguments', [('arg', (1, 6), 'a', None, None)], [('arg', (1, 12), 'c', None, None), ('arg', (1, 15), 'd', None, None), ('arg', (1, 18), 'e', None, None)], None, [], [], None, []), [('Pass', (1, 22))], [], None, None)], []),
