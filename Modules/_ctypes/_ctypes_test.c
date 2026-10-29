@@ -405,7 +405,7 @@ EXPORT(char *)my_strtok(char *token, const char *delim)
     return strtok(token, delim);
 }
 
-EXPORT(char *)my_strchr(const char *s, int c)
+EXPORT(const char *) my_strchr(const char *s, int c)
 {
     return strchr(s, c);
 }
@@ -578,6 +578,11 @@ EXPORT(long long) _testfunc_callback_q_qf(long long value,
         value /= 2;
     }
     return sum;
+}
+
+EXPORT(long long) _testfunc_callback_int_to_longlong(int (*func)(void))
+{
+    return func();
 }
 
 typedef struct {

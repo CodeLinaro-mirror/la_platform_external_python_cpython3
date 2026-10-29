@@ -587,6 +587,70 @@ class PyBytesIOTest(MemoryTestMixin, MemorySeekTestMixin, unittest.TestCase):
         self.ioclass(initial_bytes=buf)
         self.assertRaises(TypeError, self.ioclass, buf, foo=None)
 
+    def test_write_concurrent_close(self):
+        class B:
+            def __buffer__(self, flags):
+                memio.close()
+                return memoryview(b"A")
+
+        memio = self.ioclass()
+        self.assertRaises(ValueError, memio.write, B())
+
+    # Prevent crashes when memio.write() or memio.writelines()
+    # concurrently mutates (e.g., closes or exports) 'memio'.
+    # See: https://github.com/python/cpython/issues/143378.
+
+    def test_writelines_concurrent_close(self):
+        class B:
+            def __buffer__(self, flags):
+                memio.close()
+                return memoryview(b"A")
+
+        memio = self.ioclass()
+        self.assertRaises(ValueError, memio.writelines, [B()])
+
+    def test_write_concurrent_export(self):
+        class B:
+            buf = None
+            def __buffer__(self, flags):
+                self.buf = memio.getbuffer()
+                return memoryview(b"A")
+
+        memio = self.ioclass()
+        self.assertRaises(BufferError, memio.write, B())
+
+    def test_writelines_concurrent_export(self):
+        class B:
+            buf = None
+            def __buffer__(self, flags):
+                self.buf = memio.getbuffer()
+                return memoryview(b"A")
+
+        memio = self.ioclass()
+        self.assertRaises(BufferError, memio.writelines, [B()])
+
+    def test_write_mutating_buffer(self):
+        # Test that buffer is exported only once during write().
+        # See: https://github.com/python/cpython/issues/143602.
+        class B:
+            count = 0
+            def __buffer__(self, flags):
+                self.count += 1
+                if self.count == 1:
+                    return memoryview(b"AAA")
+                else:
+                    return memoryview(b"BBBBBBBBB")
+
+        memio = self.ioclass(b'0123456789')
+        memio.seek(2)
+        b = B()
+        n = memio.write(b)
+
+        self.assertEqual(b.count, 1)
+        self.assertEqual(n, 3)
+        self.assertEqual(memio.getvalue(), b"01AAA56789")
+        self.assertEqual(memio.tell(), 5)
+
 
 class TextIOTestMixin:
 
@@ -855,6 +919,18 @@ class CBytesIOTest(PyBytesIOTest):
         old_rc = sys.getrefcount(ba)
         memio = self.ioclass(ba)
         self.assertEqual(sys.getrefcount(ba), old_rc)
+
+    def test_write_with_export(self):
+        memio = self.ioclass(b"abcd")
+        memio.seek(2)
+        with memio.getbuffer() as view:
+            self.assertRaises(BufferError, memio.__init__, b"replacement")
+            self.assertEqual(memio.tell(), 2)
+            self.assertEqual(memio.getvalue(), b"abcd")
+            self.assertEqual(bytes(view), b"abcd")
+        memio.write(b"X")
+        self.assertEqual(memio.getvalue(), b"abXd")
+
 
 class CStringIOTest(PyStringIOTest):
     ioclass = io.StringIO

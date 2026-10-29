@@ -263,6 +263,12 @@ or request "multi-phase initialization" by returning the definition struct itsel
       .. versionchanged:: 3.9
          No longer called before the module state is allocated.
 
+
+.. c:var:: PyTypeObject PyModuleDef_Type
+
+   The type of ``PyModuleDef`` objects.
+
+
 Single-phase initialization
 ...........................
 
@@ -529,6 +535,9 @@ objects dynamically. Note that both ``PyModule_FromDefAndSpec`` and
    ``PyModuleDef``, using either ``PyModule_Create`` or
    ``PyModule_FromDefAndSpec``.
 
+   Return ``0`` on success.
+   Return ``-1`` with an exception set on error.
+
    .. versionadded:: 3.5
 
 .. c:function:: int PyModule_AddFunctions(PyObject *module, PyMethodDef *functions)
@@ -608,8 +617,8 @@ state:
 
 .. c:function:: int PyModule_Add(PyObject *module, const char *name, PyObject *value)
 
-   Similar to :c:func:`PyModule_AddObjectRef`, but "steals" a reference
-   to *value*.
+   Similar to :c:func:`PyModule_AddObjectRef`, but ":term:`steals <steal>`"
+   a reference to *value* (even on error).
    It can be called with a result of function that returns a new reference
    without bothering to check its result or even saving it to a variable.
 
@@ -624,8 +633,8 @@ state:
 
 .. c:function:: int PyModule_AddObject(PyObject *module, const char *name, PyObject *value)
 
-   Similar to :c:func:`PyModule_AddObjectRef`, but steals a reference to
-   *value* on success (if it returns ``0``).
+   Similar to :c:func:`PyModule_AddObjectRef`, but :term:`steals <steal>`
+   a reference to *value* on success (if it returns ``0``).
 
    The new :c:func:`PyModule_Add` or :c:func:`PyModule_AddObjectRef`
    functions are recommended, since it is
@@ -653,9 +662,7 @@ state:
         // PyModule_AddObject() stole a reference to obj:
         // Py_XDECREF(obj) is not needed here.
 
-   .. deprecated:: 3.13
-
-      :c:func:`PyModule_AddObject` is :term:`soft deprecated`.
+   .. soft-deprecated:: 3.13
 
 
 .. c:function:: int PyModule_AddIntConstant(PyObject *module, const char *name, long value)

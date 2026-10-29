@@ -46,7 +46,8 @@ def _supports_sched():
     try:
         posix.sched_getscheduler(0)
     except OSError as e:
-        if e.errno == errno.ENOSYS:
+        # DragonFly BSD requires privileges to use the scheduler API.
+        if e.errno in (errno.ENOSYS, errno.EPERM):
             return False
     return True
 
@@ -70,7 +71,7 @@ class PosixTester(unittest.TestCase):
         NO_ARG_FUNCTIONS = [ "ctermid", "getcwd", "getcwdb", "uname",
                              "times", "getloadavg",
                              "getegid", "geteuid", "getgid", "getgroups",
-                             "getpid", "getpgrp", "getppid", "getuid", "sync",
+                             "getpid", "getpgrp", "getppid", "getuid",
                            ]
 
         for name in NO_ARG_FUNCTIONS:
@@ -79,6 +80,13 @@ class PosixTester(unittest.TestCase):
                 with self.subTest(name):
                     posix_func()
                     self.assertRaises(TypeError, posix_func, 1)
+
+    # gh-102184: sync() can block for a long time.
+    @support.requires_resource('walltime')
+    @unittest.skipUnless(hasattr(posix, 'sync'), 'test needs posix.sync()')
+    def test_sync(self):
+        posix.sync()
+        self.assertRaises(TypeError, posix.sync, 1)
 
     @unittest.skipUnless(hasattr(posix, 'getresuid'),
                          'test needs posix.getresuid()')
@@ -415,8 +423,10 @@ class PosixTester(unittest.TestCase):
             if inst.errno == errno.EINVAL and sys.platform.startswith(
                 ('sunos', 'freebsd', 'openbsd', 'gnukfreebsd')):
                 raise unittest.SkipTest("test may fail on ZFS filesystems")
-            elif inst.errno == errno.EOPNOTSUPP and sys.platform.startswith("netbsd"):
-                raise unittest.SkipTest("test may fail on FFS filesystems")
+            elif inst.errno == errno.EOPNOTSUPP:
+                # ZFS on FreeBSD, FFS on NetBSD, etc.
+                raise unittest.SkipTest(
+                    "the file system does not support posix_fallocate()")
             else:
                 raise
         finally:
@@ -668,6 +678,18 @@ class PosixTester(unittest.TestCase):
         finally:
             fp.close()
 
+    @unittest.skipUnless(hasattr(posix, 'stat'),
+                         'test needs posix.stat()')
+    @unittest.skipUnless(os.stat in os.supports_follow_symlinks,
+                         'test needs follow_symlinks support in os.stat()')
+    def test_stat_fd_zero_follow_symlinks(self):
+        with self.assertRaisesRegex(ValueError,
+                'cannot use fd and follow_symlinks together'):
+            posix.stat(0, follow_symlinks=False)
+        with self.assertRaisesRegex(ValueError,
+                'cannot use fd and follow_symlinks together'):
+            posix.stat(1, follow_symlinks=False)
+
     def test_stat(self):
         self.assertTrue(posix.stat(os_helper.TESTFN))
         self.assertTrue(posix.stat(os.fsencode(os_helper.TESTFN)))
@@ -826,7 +848,9 @@ class PosixTester(unittest.TestCase):
             self.assertRaises(OSError, chown_func, first_param, 0, -1)
             check_stat(uid, gid)
             if hasattr(os, 'getgroups'):
-                if 0 not in os.getgroups():
+                # Also check the effective gid, which the kernel
+                # accepts for chown even if not in getgroups().
+                if 0 not in os.getgroups() and os.getegid() != 0:
                     self.assertRaises(OSError, chown_func, first_param, -1, 0)
                     check_stat(uid, gid)
         # test illegal types
@@ -1374,6 +1398,7 @@ class PosixTester(unittest.TestCase):
         del sched_priority, param  # should not crash
         support.gc_collect()  # just to be sure
 
+    @requires_sched
     @unittest.skipUnless(hasattr(posix, "sched_rr_get_interval"), "no function")
     def test_sched_rr_get_interval(self):
         try:
@@ -1876,6 +1901,11 @@ class _PosixSpawnMixin:
         )
         support.wait_process(pid, exitcode=0)
 
+    def test_setpgroup_allow_none(self):
+        path, args = self.NOOP_PROGRAM[0], self.NOOP_PROGRAM
+        pid = self.spawn_func(path, args, os.environ, setpgroup=None)
+        support.wait_process(pid, exitcode=0)
+
     def test_setpgroup_wrong_type(self):
         with self.assertRaises(TypeError):
             self.spawn_func(sys.executable,
@@ -1975,6 +2005,20 @@ class _PosixSpawnMixin:
             self.spawn_func(sys.executable,
                             [sys.executable, "-c", "pass"],
                             os.environ, setsigdef=[signal.NSIG, signal.NSIG+1])
+
+    def test_scheduler_allow_none(self):
+        path, args = self.NOOP_PROGRAM[0], self.NOOP_PROGRAM
+        pid = self.spawn_func(path, args, os.environ, scheduler=None)
+        support.wait_process(pid, exitcode=0)
+
+    @support.subTests("scheduler", [object(), 1, [1, 2]])
+    def test_scheduler_wrong_type(self, scheduler):
+        path, args = self.NOOP_PROGRAM[0], self.NOOP_PROGRAM
+        with self.assertRaisesRegex(
+            TypeError,
+            "scheduler must be a tuple or None",
+        ):
+            self.spawn_func(path, args, os.environ, scheduler=scheduler)
 
     @requires_sched
     @unittest.skipIf(sys.platform.startswith(('freebsd', 'netbsd')),

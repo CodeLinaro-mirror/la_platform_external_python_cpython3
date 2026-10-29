@@ -259,6 +259,10 @@ Type Objects
    Return the module object associated with the given type when the type was
    created using :c:func:`PyType_FromModuleAndSpec`.
 
+   The returned reference is :term:`borrowed <borrowed reference>` from *type*,
+   and will be valid as long as you hold a reference to *type*.
+   Do not release it with :c:func:`Py_DECREF` or similar.
+
    If no module is associated with the given type, sets :py:class:`TypeError`
    and returns ``NULL``.
 
@@ -490,7 +494,7 @@ The following functions and structs are used to create
       in the following situations:
 
       - The base is not variable-sized (its
-        :c:member:`~PyTypeObject.tp_itemsize`).
+        :c:member:`~PyTypeObject.tp_itemsize` is zero).
       - The requested :c:member:`PyType_Spec.basicsize` is positive,
         suggesting that the memory layout of the base class is known.
       - The requested :c:member:`PyType_Spec.basicsize` is zero,

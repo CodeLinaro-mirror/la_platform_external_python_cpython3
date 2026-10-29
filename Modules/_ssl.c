@@ -60,6 +60,7 @@
 /* Include OpenSSL header files */
 #include "openssl/rsa.h"
 #include "openssl/crypto.h"
+#include "openssl/evp.h"
 #include "openssl/x509.h"
 #include "openssl/x509v3.h"
 #include "openssl/pem.h"
@@ -296,7 +297,7 @@ typedef struct {
     int post_handshake_auth;
 #endif
     PyObject *msg_cb;
-    PyObject *keylog_filename;
+    PyObject *keylog_filename;  // can be anything accepted by Py_fopen()
     BIO *keylog_bio;
     /* Cached module state, also used in SSLSocket and SSLSession code. */
     _sslmodulestate *state;
@@ -324,7 +325,7 @@ typedef struct {
     PySSLContext *ctx; /* weakref to SSL context */
     char shutdown_seen_zero;
     enum py_ssl_server_or_client socket_type;
-    PyObject *owner; /* Python level "owner" passed to servername callback */
+    PyObject *owner; /* weakref to Python level "owner" passed to servername callback */
     PyObject *server_hostname;
     _PySSLError err; /* last seen error from various sources */
     /* Some SSL callbacks don't have error reporting. Callback wrappers
@@ -851,8 +852,8 @@ newPySSLSocket(PySSLContext *sslctx, PySocketSockObject *sock,
     self->ssl = SSL_new(ctx);
     PySSL_END_ALLOW_THREADS(sslctx)
     if (self->ssl == NULL) {
+        _setSSLError(get_state_ctx(sslctx), NULL, 0, __FILE__, __LINE__);
         Py_DECREF(self);
-        _setSSLError(get_state_ctx(self), NULL, 0, __FILE__, __LINE__);
         return NULL;
     }
 
@@ -892,7 +893,9 @@ newPySSLSocket(PySSLContext *sslctx, PySocketSockObject *sock,
             int mode = SSL_get_verify_mode(self->ssl);
             if (mode & SSL_VERIFY_PEER) {
                 mode |= SSL_VERIFY_POST_HANDSHAKE;
-                SSL_set_verify(self->ssl, mode, NULL);
+                /* Keep ctx verify callback (distrusted SPKI check) */
+                SSL_set_verify(self->ssl, mode,
+                               SSL_get_verify_callback(self->ssl));
             }
         } else {
             /* client socket */
@@ -2173,14 +2176,15 @@ _ssl._SSLSocket.context
 
 This changes the context associated with the SSLSocket.
 
-This is typically used from within a callback function set by the sni_callback
-on the SSLContext to change the certificate information associated with the
-SSLSocket before the cryptographic exchange handshake messages.
+This is typically used from within a callback function set by the
+sni_callback on the SSLContext to change the certificate information
+associated with the SSLSocket before the cryptographic exchange
+handshake messages.
 [clinic start generated code]*/
 
 static PyObject *
 _ssl__SSLSocket_context_get_impl(PySSLSocket *self)
-/*[clinic end generated code: output=d23e82f72f32e3d7 input=7cbb97407c2ace30]*/
+/*[clinic end generated code: output=d23e82f72f32e3d7 input=b845dea1f9710ebe]*/
 {
     return Py_NewRef(self->ctx);
 }
@@ -2294,6 +2298,10 @@ PySSL_traverse(PySSLSocket *self, visitproc visit, void *arg)
 static int
 PySSL_clear(PySSLSocket *self)
 {
+    Py_CLEAR(self->Socket);
+    Py_CLEAR(self->ctx);
+    Py_CLEAR(self->owner);
+    Py_CLEAR(self->server_hostname);
     Py_CLEAR(self->exc);
     return 0;
 }
@@ -2317,10 +2325,7 @@ PySSL_dealloc(PySSLSocket *self)
         SSL_set_shutdown(self->ssl, SSL_SENT_SHUTDOWN | SSL_get_shutdown(self->ssl));
         SSL_free(self->ssl);
     }
-    Py_XDECREF(self->Socket);
-    Py_XDECREF(self->ctx);
-    Py_XDECREF(self->server_hostname);
-    Py_XDECREF(self->owner);
+    (void)PySSL_clear(self);
     PyObject_GC_Del(self);
     Py_DECREF(tp);
 }
@@ -2807,15 +2812,16 @@ _ssl._SSLSocket.get_channel_binding
 
 Get channel binding data for current connection.
 
-Raise ValueError if the requested `cb_type` is not supported.  Return bytes
-of the data or None if the data is not available (e.g. before the handshake).
+Raise ValueError if the requested `cb_type` is not supported.
+Return bytes of the data or None if the data is not available (e.g.
+before the handshake).
 Only 'tls-unique' channel binding data from RFC 5929 is supported.
 [clinic start generated code]*/
 
 static PyObject *
 _ssl__SSLSocket_get_channel_binding_impl(PySSLSocket *self,
                                          const char *cb_type)
-/*[clinic end generated code: output=34bac9acb6a61d31 input=e008004fc08744db]*/
+/*[clinic end generated code: output=34bac9acb6a61d31 input=bed81ef7936535a0]*/
 {
     char buf[PySSL_CB_MAXLEN];
     size_t len;
@@ -3014,6 +3020,66 @@ static PyType_Spec PySSLSocket_spec = {
  * _SSLContext objects
  */
 
+#include "_ssl/distrusted_spki.h"
+
+/* Returns 1 if the SHA-256 of the cert's SPKI is on the distrusted list,
+   0 if not (okay), -1 on an internal error. */
+static int
+_cert_has_distrusted_spki(X509 *cert)
+{
+    unsigned char *spki = NULL;
+    int spki_len = i2d_X509_PUBKEY(X509_get_X509_PUBKEY(cert), &spki);
+    if (spki_len <= 0 || spki == NULL) {
+        return -1;
+    }
+
+    unsigned char digest[EVP_MAX_MD_SIZE];
+    unsigned int digest_len = 0;
+    int ok = EVP_Digest(spki, (size_t)spki_len, digest, &digest_len,
+                        EVP_sha256(), NULL);
+    OPENSSL_free(spki);
+    assert(sizeof(_distrusted_spki[0]) == SHA256_DIGEST_LENGTH);
+    if (!ok
+        || digest_len != SHA256_DIGEST_LENGTH
+        || sizeof(_distrusted_spki[0]) != SHA256_DIGEST_LENGTH) {
+        return -1;
+    }
+
+    for (size_t i = 0; i < Py_ARRAY_LENGTH(_distrusted_spki); i++) {
+        if (memcmp(digest, _distrusted_spki[i], SHA256_DIGEST_LENGTH) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* Verify callback, called once per cert. Reject distrusted SPKIs. */
+static int
+_ssl_verify_callback(int preverify_ok, X509_STORE_CTX *x509_ctx)
+{
+    /* Don't override an error OpenSSL already reported for this certificate. */
+    if (!preverify_ok) {
+        return preverify_ok;
+    }
+    X509 *cert = X509_STORE_CTX_get_current_cert(x509_ctx);
+    if (cert == NULL) {
+        return preverify_ok;
+    }
+    switch (_cert_has_distrusted_spki(cert)) {
+    case 0:
+        /* okay: not on the distrusted list */
+        return preverify_ok;
+    case 1:
+        /* rejected: public key is on the distrusted list */
+        X509_STORE_CTX_set_error(x509_ctx, X509_V_ERR_CERT_REJECTED);
+        return 0;
+    default:
+        /* internal error */
+        X509_STORE_CTX_set_error(x509_ctx, X509_V_ERR_UNSPECIFIED);
+        return 0;
+    }
+}
+
 static int
 _set_verify_mode(PySSLContext *self, enum py_ssl_cert_requirements n)
 {
@@ -3038,7 +3104,7 @@ _set_verify_mode(PySSLContext *self, enum py_ssl_cert_requirements n)
     /* bpo-37428: newPySSLSocket() sets SSL_VERIFY_POST_HANDSHAKE flag for
      * server sockets and SSL_set_post_handshake_auth() for client. */
 
-    SSL_CTX_set_verify(self->ctx, mode, NULL);
+    SSL_CTX_set_verify(self->ctx, mode, _ssl_verify_callback);
     return 0;
 }
 
@@ -3257,6 +3323,11 @@ context_traverse(PySSLContext *self, visitproc visit, void *arg)
 {
     Py_VISIT(self->set_sni_cb);
     Py_VISIT(self->msg_cb);
+    Py_VISIT(self->keylog_filename);
+#ifndef OPENSSL_NO_PSK
+    Py_VISIT(self->psk_client_callback);
+    Py_VISIT(self->psk_server_callback);
+#endif
     Py_VISIT(Py_TYPE(self));
     return 0;
 }
@@ -3288,6 +3359,9 @@ context_dealloc(PySSLContext *self)
     /* bpo-31095: UnTrack is needed before calling any callbacks */
     PyObject_GC_UnTrack(self);
     context_clear(self);
+    /* The SSL_CTX may outlive this object as the session_ctx of sockets that
+       were switched to another context; leave no Python callback behind. */
+    SSL_CTX_set_tlsext_servername_callback(self->ctx, NULL);
     SSL_CTX_free(self->ctx);
     PyMem_FREE(self->alpn_protocols);
     Py_TYPE(self)->tp_free(self);
@@ -3537,15 +3611,11 @@ _ssl__SSLContext_verify_flags_set_impl(PySSLContext *self, PyObject *value)
 static int
 set_min_max_proto_version(PySSLContext *self, PyObject *arg, int what)
 {
-    long v;
+    int v;
     int result;
 
-    if (!PyArg_Parse(arg, "l", &v))
+    if (!PyArg_Parse(arg, "i", &v))
         return -1;
-    if (v > INT_MAX) {
-        PyErr_SetString(PyExc_OverflowError, "Option is too long");
-        return -1;
-    }
 
     switch(self->protocol) {
     case PY_SSL_VERSION_TLS_CLIENT:  /* fall through */
@@ -3580,7 +3650,7 @@ set_min_max_proto_version(PySSLContext *self, PyObject *arg, int what)
             break;
         default:
             PyErr_Format(PyExc_ValueError,
-                     "Unsupported TLS/SSL version 0x%x", v);
+                     "Unsupported TLS/SSL version 0x%x", (unsigned)v);
             return -1;
     }
 
@@ -3614,7 +3684,7 @@ set_min_max_proto_version(PySSLContext *self, PyObject *arg, int what)
     }
     if (result == 0) {
         PyErr_Format(PyExc_ValueError,
-                     "Unsupported protocol version 0x%x", v);
+                     "Unsupported protocol version 0x%x", (unsigned)v);
         return -1;
     }
     return 0;
@@ -4602,26 +4672,41 @@ _ssl__SSLContext_set_ecdh_curve_impl(PySSLContext *self, PyObject *name)
 }
 
 static int
-_servername_callback(SSL *s, int *al, void *args)
+_servername_callback(SSL *s, int *al, void *Py_UNUSED(args))
 {
     int ret;
-    PySSLContext *sslctx = (PySSLContext *) args;
+    PySSLContext *sslctx;
     PySSLSocket *ssl;
     PyObject *result;
     /* The high-level ssl.SSLSocket object */
-    PyObject *ssl_socket;
+    PyObject *ssl_socket = NULL;
+    PyObject *sni_cb;
     const char *servername = SSL_get_servername(s, TLSEXT_NAMETYPE_host_name);
     PyGILState_STATE gstate = PyGILState_Ensure();
 
-    if (sslctx->set_sni_cb == NULL) {
-        /* remove race condition in this the call back while if removing the
-         * callback is in progress */
+    /* Do not use the SSL_CTX's servername arg to find the context: it is a
+       borrowed pointer to whichever _SSLContext installed the callback, and
+       that object may already be gone while OpenSSL still reaches this
+       callback through the connection's session_ctx (e.g. on the second
+       ClientHello after a HelloRetryRequest, once sni_callback has switched
+       the socket to another context).  The socket's current context is
+       always alive; hold strong references to it and to the callback while
+       they are used here. */
+    ssl = SSL_get_app_data(s);
+    assert(ssl != NULL);
+    Py_BEGIN_CRITICAL_SECTION(ssl);
+    sslctx = (PySSLContext *)Py_NewRef(ssl->ctx);
+    Py_END_CRITICAL_SECTION();
+    assert(Py_IS_TYPE(ssl, get_state_ctx(sslctx)->PySSLSocket_Type));
+
+    Py_BEGIN_CRITICAL_SECTION(sslctx);
+    sni_cb = Py_XNewRef(sslctx->set_sni_cb);
+    Py_END_CRITICAL_SECTION();
+    if (sni_cb == NULL) {
+        Py_DECREF(sslctx);
         PyGILState_Release(gstate);
         return SSL_TLSEXT_ERR_OK;
     }
-
-    ssl = SSL_get_app_data(s);
-    assert(Py_IS_TYPE(ssl, get_state_ctx(sslctx)->PySSLSocket_Type));
 
     /* The servername callback expects an argument that represents the current
      * SSL connection and that has a .context attribute that can be changed to
@@ -4642,7 +4727,7 @@ _servername_callback(SSL *s, int *al, void *args)
         goto error;
 
     if (servername == NULL) {
-        result = PyObject_CallFunctionObjArgs(sslctx->set_sni_cb, ssl_socket,
+        result = PyObject_CallFunctionObjArgs(sni_cb, ssl_socket,
                                               Py_None, sslctx, NULL);
     }
     else {
@@ -4665,14 +4750,14 @@ _servername_callback(SSL *s, int *al, void *args)
         }
         Py_DECREF(servername_bytes);
         result = PyObject_CallFunctionObjArgs(
-            sslctx->set_sni_cb, ssl_socket, servername_str,
+            sni_cb, ssl_socket, servername_str,
             sslctx, NULL);
         Py_DECREF(servername_str);
     }
     Py_DECREF(ssl_socket);
 
     if (result == NULL) {
-        PyErr_WriteUnraisable(sslctx->set_sni_cb);
+        PyErr_WriteUnraisable(sni_cb);
         *al = SSL_AD_HANDSHAKE_FAILURE;
         ret = SSL_TLSEXT_ERR_ALERT_FATAL;
     }
@@ -4693,11 +4778,15 @@ _servername_callback(SSL *s, int *al, void *args)
         Py_DECREF(result);
     }
 
+    Py_DECREF(sni_cb);
+    Py_DECREF(sslctx);
     PyGILState_Release(gstate);
     return ret;
 
 error:
-    Py_DECREF(ssl_socket);
+    Py_XDECREF(ssl_socket);
+    Py_DECREF(sni_cb);
+    Py_DECREF(sslctx);
     *al = SSL_AD_INTERNAL_ERROR;
     ret = SSL_TLSEXT_ERR_ALERT_FATAL;
     PyGILState_Release(gstate);
@@ -4711,15 +4800,16 @@ _ssl._SSLContext.sni_callback
 
 Set a callback that will be called when a server name is provided by the SSL/TLS client in the SNI extension.
 
-If the argument is None then the callback is disabled. The method is called
-with the SSLSocket, the server name as a string, and the SSLContext object.
+If the argument is None then the callback is disabled.  The method
+is called with the SSLSocket, the server name as a string, and the
+SSLContext object.
 
 See RFC 6066 for details of the SNI extension.
 [clinic start generated code]*/
 
 static PyObject *
 _ssl__SSLContext_sni_callback_get_impl(PySSLContext *self)
-/*[clinic end generated code: output=961e6575cdfaf036 input=9b2473c5e984cfe6]*/
+/*[clinic end generated code: output=961e6575cdfaf036 input=280120c01d089dc3]*/
 {
     PyObject *cb = self->set_sni_cb;
     if (cb == NULL) {
@@ -4756,7 +4846,6 @@ _ssl__SSLContext_sni_callback_set_impl(PySSLContext *self, PyObject *value)
         }
         self->set_sni_cb = Py_NewRef(value);
         SSL_CTX_set_tlsext_servername_callback(self->ctx, _servername_callback);
-        SSL_CTX_set_tlsext_servername_arg(self->ctx, self);
     }
     return 0;
 }
@@ -4811,16 +4900,16 @@ _ssl._SSLContext.cert_store_stats
 
 Returns quantities of loaded X.509 certificates.
 
-X.509 certificates with a CA extension and certificate revocation lists
-inside the context's cert store.
+X.509 certificates with a CA extension and certificate revocation
+lists inside the context's cert store.
 
-NOTE: Certificates in a capath directory aren't loaded unless they have
-been used at least once.
+NOTE: Certificates in a capath directory aren't loaded unless they
+have been used at least once.
 [clinic start generated code]*/
 
 static PyObject *
 _ssl__SSLContext_cert_store_stats_impl(PySSLContext *self)
-/*[clinic end generated code: output=5f356f4d9cca874d input=d13c6e3f2b48539b]*/
+/*[clinic end generated code: output=5f356f4d9cca874d input=9e5094e094b892a3]*/
 {
     X509_STORE *store;
     STACK_OF(X509_OBJECT) *objs;
@@ -4863,16 +4952,16 @@ _ssl._SSLContext.get_ca_certs
 
 Returns a list of dicts with information of loaded CA certs.
 
-If the optional argument is True, returns a DER-encoded copy of the CA
-certificate.
+If the optional argument is True, returns a DER-encoded copy of the
+CA certificate.
 
-NOTE: Certificates in a capath directory aren't loaded unless they have
-been used at least once.
+NOTE: Certificates in a capath directory aren't loaded unless they
+have been used at least once.
 [clinic start generated code]*/
 
 static PyObject *
 _ssl__SSLContext_get_ca_certs_impl(PySSLContext *self, int binary_form)
-/*[clinic end generated code: output=0d58f148f37e2938 input=eb0592909c9ad6e7]*/
+/*[clinic end generated code: output=0d58f148f37e2938 input=9f71af5aa4e67076]*/
 {
     X509_STORE *store;
     STACK_OF(X509_OBJECT) *objs;
@@ -5760,13 +5849,13 @@ _ssl.RAND_status
 
 Returns True if the OpenSSL PRNG has been seeded with enough data and False if not.
 
-It is necessary to seed the PRNG with RAND_add() on some platforms before
-using the ssl() function.
+It is necessary to seed the PRNG with RAND_add() on some platforms
+before using the ssl() function.
 [clinic start generated code]*/
 
 static PyObject *
 _ssl_RAND_status_impl(PyObject *module)
-/*[clinic end generated code: output=7e0aaa2d39fdc1ad input=636fb5659ea2e727]*/
+/*[clinic end generated code: output=7e0aaa2d39fdc1ad input=844b0dc0f2165e87]*/
 {
     return PyBool_FromLong(RAND_status());
 }
@@ -6028,16 +6117,16 @@ _ssl.enum_certificates
 
 Retrieve certificates from Windows' cert store.
 
-store_name may be one of 'CA', 'ROOT' or 'MY'.  The system may provide
-more cert storages, too.  The function returns a list of (bytes,
-encoding_type, trust) tuples.  The encoding_type flag can be interpreted
-with X509_ASN_ENCODING or PKCS_7_ASN_ENCODING. The trust setting is either
-a set of OIDs or the boolean True.
+store_name may be one of 'CA', 'ROOT' or 'MY'.  The system may
+provide more cert storages, too.  The function returns a list of
+(bytes, encoding_type, trust) tuples.  The encoding_type flag can be
+interpreted with X509_ASN_ENCODING or PKCS_7_ASN_ENCODING.  The
+trust setting is either a set of OIDs or the boolean True.
 [clinic start generated code]*/
 
 static PyObject *
 _ssl_enum_certificates_impl(PyObject *module, const char *store_name)
-/*[clinic end generated code: output=5134dc8bb3a3c893 input=263c22e6c6988cf3]*/
+/*[clinic end generated code: output=5134dc8bb3a3c893 input=ef81b4bd1b7ab8e9]*/
 {
     HCERTSTORE hCollectionStore = NULL;
     PCCERT_CONTEXT pCertCtx = NULL;

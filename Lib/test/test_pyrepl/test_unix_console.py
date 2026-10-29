@@ -1,15 +1,15 @@
 import errno
 import itertools
 import os
+import select
 import signal
-import subprocess
 import sys
 import threading
 import unittest
 from functools import partial
-from test import support
 from test.support import os_helper
-from test.support import script_helper, threading_helper
+from test.support import is_android, is_apple_mobile, is_emscripten, is_wasi
+from test.support import threading_helper
 
 from unittest import TestCase
 from unittest.mock import MagicMock, call, patch, ANY, Mock
@@ -125,6 +125,20 @@ TERM_CAPABILITIES = {
 @patch("termios.tcsetattr", lambda a, b, c: None)
 @patch("os.write")
 class TestConsole(TestCase):
+    def test_no_newline(self, _os_write):
+        code = "1"
+        events = code_to_events(code)
+        _, con = handle_events_unix_console(events)
+        self.assertNotIn(call(ANY, b'\n'), _os_write.mock_calls)
+        con.restore()
+
+    def test_newline(self, _os_write):
+        code = "\n"
+        events = code_to_events(code)
+        _, con = handle_events_unix_console(events)
+        _os_write.assert_any_call(ANY, b"\n")
+        con.restore()
+
     def test_simple_addition(self, _os_write):
         code = "12+34"
         events = code_to_events(code)
@@ -381,33 +395,91 @@ class TestUnixConsoleEIOHandling(TestCase):
         # EIO error should be handled gracefully in restore()
         console.restore()
 
-    @unittest.skipUnless(sys.platform == "linux", "Only valid on Linux")
-    def test_repl_eio(self):
-        # Use the pty-based approach to simulate EIO error
-        script_path = os.path.join(os.path.dirname(__file__), "eio_test_script.py")
 
-        proc = script_helper.spawn_python(
-            "-S", script_path,
-            stderr=subprocess.PIPE,
-            text=True
-        )
+try:
+    import pty
+    import termios as _termios
+except ImportError:
+    pty = None
 
-        ready_line = proc.stdout.readline().strip()
-        if ready_line != "READY" or proc.poll() is not None:
-            self.fail("Child process failed to start properly")
 
-        os.kill(proc.pid, signal.SIGUSR1)
-        # sleep for pty to settle
-        _, err = proc.communicate(timeout=support.LONG_TIMEOUT)
-        self.assertEqual(
-            proc.returncode,
-            1,
-            f"Expected EIO/ENXIO error, got return code {proc.returncode}",
-        )
-        self.assertTrue(
-            (
-                "Got EIO:" in err
-                or "Got ENXIO:" in err
-            ),
-            f"Expected EIO/ENXIO error message in stderr: {err}",
-        )
+@unittest.skipIf(sys.platform == "win32", "No Unix console on Windows")
+@unittest.skipUnless(pty, "requires pty")
+@unittest.skipIf(is_android or is_apple_mobile or is_emscripten or is_wasi,
+                 "pty is not available on this platform")
+class TestUnixConsoleInputHook(TestCase):
+    # gh-152907: the console must restore cooked output (OPOST) around
+    # input-hook calls, then re-enter raw mode.
+
+    def test_input_hook_output_is_cooked(self):
+        master_fd, slave_fd = pty.openpty()
+        self.addCleanup(os.close, master_fd)
+
+        # tcsetattr(TCSADRAIN) blocks on some platforms (e.g. macOS) while the
+        # master still holds unread output, so empty it before each mode switch.
+        def drain():
+            out = b""
+            while select.select([master_fd], [], [], 0)[0]:
+                try:
+                    data = os.read(master_fd, 4096)
+                except OSError:
+                    break
+                if not data:
+                    break
+                out += data
+            return out
+
+        # Start from a cooked terminal so there are saved flags to restore.
+        attr = _termios.tcgetattr(slave_fd)
+        attr[1] |= _termios.OPOST | _termios.ONLCR
+        _termios.tcsetattr(slave_fd, _termios.TCSANOW, attr)
+
+        console = UnixConsole(slave_fd, slave_fd, term="xterm")
+        console.prepare()
+        try:
+            drain()  # discard prepare()'s own setup sequences
+            # pyrepl's own rendering runs with OPOST cleared.
+            self.assertFalse(_termios.tcgetattr(slave_fd)[1] & _termios.OPOST)
+
+            observed = {}
+
+            def fake_hook():
+                observed["oflag"] = _termios.tcgetattr(slave_fd)[1]
+                os.write(slave_fd, b"line1\nline2\n")
+                observed["output"] = drain()
+                return 0
+
+            with (patch("posix._is_inputhook_installed", return_value=True),
+                  patch("posix._inputhook", side_effect=fake_hook)):
+                hook = console.input_hook
+                self.assertIsNotNone(hook)
+                self.assertEqual(hook(), 0)
+
+            # The hook ran with cooked output (OPOST on)...
+            self.assertTrue(observed["oflag"] & _termios.OPOST)
+            # ...and raw mode was restored afterwards.
+            self.assertFalse(_termios.tcgetattr(slave_fd)[1] & _termios.OPOST)
+            # The tty translated the hook's bare '\n' into '\r\n'.
+            self.assertEqual(observed["output"], b"line1\r\nline2\r\n")
+        finally:
+            # restore() writes and only then switches modes, so there is no
+            # point left to drain from here; keep the master empty elsewhere.
+            stop = threading.Event()
+
+            def pump():
+                while not stop.is_set():
+                    if select.select([master_fd], [], [], 0.05)[0]:
+                        try:
+                            if not os.read(master_fd, 4096):
+                                break
+                        except OSError:
+                            break
+
+            pump_thread = threading.Thread(target=pump)
+            pump_thread.start()
+            try:
+                console.restore()
+            finally:
+                stop.set()
+                pump_thread.join()
+                os.close(slave_fd)
