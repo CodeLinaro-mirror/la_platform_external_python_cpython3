@@ -180,18 +180,18 @@ resize_buffer(bytesio *self, size_t size)
 Py_NO_INLINE static Py_ssize_t
 write_bytes(bytesio *self, PyObject *b)
 {
-    if (check_closed(self)) {
-        return -1;
-    }
-    if (check_exports(self)) {
-        return -1;
-    }
-
     Py_buffer buf;
+    Py_ssize_t len;
     if (PyObject_GetBuffer(b, &buf, PyBUF_CONTIG_RO) < 0) {
         return -1;
     }
-    Py_ssize_t len = buf.len;
+
+    if (check_closed(self) || check_exports(self)) {
+        len = -1;
+        goto done;
+    }
+
+    len = buf.len;
     if (len == 0) {
         goto done;
     }
@@ -457,13 +457,13 @@ _io.BytesIO.read1
 
 Read at most size bytes, returned as a bytes object.
 
-If the size argument is negative or omitted, read until EOF is reached.
-Return an empty bytes object at EOF.
+If the size argument is negative or omitted, read until EOF is
+reached.  Return an empty bytes object at EOF.
 [clinic start generated code]*/
 
 static PyObject *
 _io_BytesIO_read1_impl(bytesio *self, Py_ssize_t size)
-/*[clinic end generated code: output=d0f843285aa95f1c input=440a395bf9129ef5]*/
+/*[clinic end generated code: output=d0f843285aa95f1c input=418f5968cb4f2a01]*/
 {
     return _io_BytesIO_read_impl(self, size);
 }
@@ -730,13 +730,13 @@ _io.BytesIO.writelines
 Write lines to the file.
 
 Note that newlines are not added.  lines can be any iterable object
-producing bytes-like objects. This is equivalent to calling write() for
-each element.
+producing bytes-like objects.  This is equivalent to calling write()
+for each element.
 [clinic start generated code]*/
 
 static PyObject *
 _io_BytesIO_writelines(bytesio *self, PyObject *lines)
-/*[clinic end generated code: output=7f33aa3271c91752 input=e972539176fc8fc1]*/
+/*[clinic end generated code: output=7f33aa3271c91752 input=f4e24a931ef1d528]*/
 {
     PyObject *it, *item;
 
@@ -943,15 +943,16 @@ static int
 _io_BytesIO___init___impl(bytesio *self, PyObject *initvalue)
 /*[clinic end generated code: output=65c0c51e24c5b621 input=aac7f31b67bf0fb6]*/
 {
-    /* In case, __init__ is called multiple times. */
-    self->string_size = 0;
-    self->pos = 0;
-
     if (self->exports > 0) {
         PyErr_SetString(PyExc_BufferError,
                         "Existing exports of data: object cannot be re-sized");
         return -1;
     }
+
+    /* In case, __init__ is called multiple times. */
+    self->string_size = 0;
+    self->pos = 0;
+
     if (initvalue && initvalue != Py_None) {
         if (PyBytes_CheckExact(initvalue)) {
             Py_XSETREF(self->buf, Py_NewRef(initvalue));

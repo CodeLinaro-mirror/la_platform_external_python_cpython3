@@ -6,6 +6,7 @@ import datetime
 import functools
 import gc
 import importlib
+import importlib.util
 import inspect
 import io
 import linecache
@@ -38,7 +39,7 @@ except ImportError:
 from test.support import cpython_only, import_helper, suppress_immortalization
 from test.support import MISSING_C_DOCSTRINGS, ALWAYS_EQ
 from test.support.import_helper import DirsOnSysPath, ready_to_import
-from test.support.os_helper import TESTFN, temp_cwd
+from test.support.os_helper import TESTFN, TESTFN_UNDECODABLE, temp_cwd
 from test.support.script_helper import assert_python_ok, assert_python_failure, kill_python
 from test.support import has_subprocess_support, SuppressCrashReport
 from test import support
@@ -1859,6 +1860,10 @@ class TestClassesAndFunctions(unittest.TestCase):
         self.assertEqual(inspect.get_annotations(isa2, eval_str=True), {})
         self.assertEqual(inspect.get_annotations(isa2, eval_str=False), {})
 
+        def f(*args: *tuple[int, ...]): ...
+        self.assertEqual(inspect.get_annotations(f, eval_str=True),
+                     {'args': (*tuple[int, ...],)[0]})
+
         def times_three(fn):
             @functools.wraps(fn)
             def wrapper(a, b):
@@ -2961,6 +2966,30 @@ class TestGetGeneratorState(unittest.TestCase):
         next(self.generator)
         # Running after the first yield
         next(self.generator)
+
+    def test_types_coroutine_wrapper_state(self):
+        def gen():
+            yield 1
+            yield 2
+
+        @types.coroutine
+        def wrapped_generator_coro():
+            # return a generator iterator so types.coroutine
+            # wraps it into types._GeneratorWrapper.
+            return gen()
+
+        g = wrapped_generator_coro()
+        self.addCleanup(g.close)
+        self.assertIs(type(g), types._GeneratorWrapper)
+
+        # _GeneratorWrapper must provide gi_suspended/cr_suspended
+        # so inspect.get*state() doesn't raise AttributeError.
+        self.assertEqual(inspect.getgeneratorstate(g), inspect.GEN_CREATED)
+        self.assertEqual(inspect.getcoroutinestate(g), inspect.CORO_CREATED)
+
+        next(g)
+        self.assertEqual(inspect.getgeneratorstate(g), inspect.GEN_SUSPENDED)
+        self.assertEqual(inspect.getcoroutinestate(g), inspect.CORO_SUSPENDED)
 
     def test_easy_debugging(self):
         # repr() and str() of a generator state should contain the state name
@@ -6269,8 +6298,7 @@ class TestSignatureDefinitions(unittest.TestCase):
     def test_os_module_has_signatures(self):
         unsupported_signature = {'chmod', 'utime'}
         unsupported_signature |= {name for name in
-            ['get_terminal_size', 'posix_spawn', 'posix_spawnp',
-             'register_at_fork', 'startfile']
+            ['get_terminal_size', 'register_at_fork', 'startfile']
             if hasattr(os, name)}
         self._test_module_has_signatures(os, unsupported_signature=unsupported_signature)
 
@@ -6349,7 +6377,7 @@ class TestSignatureDefinitions(unittest.TestCase):
                 methods_unsupported_signature=methods_unsupported_signature)
 
     def test_warnings_module_has_signatures(self):
-        unsupported_signature = {'warn', 'warn_explicit'}
+        unsupported_signature = {'warn_explicit'}
         self._test_module_has_signatures(warnings, unsupported_signature=unsupported_signature)
 
     def test_weakref_module_has_signatures(self):
@@ -6482,6 +6510,19 @@ class TestUnwrap(unittest.TestCase):
 
 
 class TestMain(unittest.TestCase):
+    @staticmethod
+    def _expected_cached(module):
+        # assert_python_ok() runs the subprocess in isolated mode (-I), which
+        # ignores PYTHONPYCACHEPREFIX, so compute the expected cached path the
+        # same way (i.e. without any pycache prefix) to stay independent of the
+        # environment the test suite is run in.  Modules without a cached path
+        # (e.g. frozen modules such as ntpath/importlib.machinery on Windows)
+        # report None, so preserve that.
+        if module.__spec__.cached is None:
+            return None
+        with support.swap_attr(sys, 'pycache_prefix', None):
+            return importlib.util.cache_from_source(module.__spec__.origin)
+
     def test_only_source(self):
         module = importlib.import_module('unittest')
         rc, out, err = assert_python_ok('-m', 'inspect',
@@ -6515,19 +6556,38 @@ class TestMain(unittest.TestCase):
         lines = err.decode().splitlines()
         self.assertEqual(lines, ["Can't get info for builtin modules."])
 
+    @unittest.skipUnless(TESTFN_UNDECODABLE,
+                         'requires undecodable file names')
+    def test_details_undecodable_path(self):
+        # gh-69370: the path of the module is not encodable in the encoding
+        # of stdout.
+        with temp_cwd() as test_dir:
+            subdir = os.path.join(os.fsencode(test_dir), TESTFN_UNDECODABLE)
+            try:
+                os.mkdir(subdir)
+            except OSError:
+                self.skipTest('undecodable paths are not supported')
+            with open(os.path.join(subdir, b'undecodable_mod.py'), 'w') as f:
+                f.write('"""Module docstring."""\n')
+            rc, out, err = assert_python_ok('-X', 'utf8=0', '-m', 'inspect',
+                                            '--details', 'undecodable_mod',
+                                            PYTHONPATH=os.fsdecode(subdir))
+        self.assertIn(b'Target: undecodable_mod', out)
+        self.assertEqual(err, b'')
+
     def test_details(self):
         module = importlib.import_module('unittest')
         args = support.optim_args_from_interpreter_flags()
         rc, out, err = assert_python_ok(*args, '-m', 'inspect',
                                         'unittest', '--details')
         output = out.decode()
+        cached = self._expected_cached(module)
         # Just a quick sanity check on the output
         self.assertIn(module.__spec__.name, output)
         self.assertIn(module.__name__, output)
         self.assertIn(module.__spec__.origin, output)
         self.assertIn(module.__file__, output)
-        self.assertIn(module.__spec__.cached, output)
-        self.assertIn(module.__cached__, output)
+        self.assertIn(cached, output)
         self.assertEqual(err, b'')
 
 

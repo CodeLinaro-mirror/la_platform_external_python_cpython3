@@ -1,6 +1,7 @@
 import _pyio
 import array
 import contextlib
+import errno
 import importlib.util
 import io
 import itertools
@@ -643,6 +644,12 @@ class StoredTestsWithSourceFile(AbstractTestsWithSourceFile,
         try:
             os.utime(TESTFN, (ts, ts))
         except OverflowError:
+            self.skipTest('Host fs cannot set timestamp to required value.')
+        except OSError as exc:
+            # Some file systems (e.g. UFS and ZFS on illumos) do not
+            # support timestamps that do not fit in 32 bits.
+            if exc.errno != errno.EOVERFLOW:
+                raise
             self.skipTest('Host fs cannot set timestamp to required value.')
 
         mtime_ns = os.stat(TESTFN).st_mtime_ns
@@ -2428,6 +2435,10 @@ class OtherTests(unittest.TestCase):
 
     @requires_zlib()
     def test_full_overlap_different_names(self):
+        # The ZIP file contains two central directory entries with
+        # different names which refer to the same local header.
+        # The name of the local header matches the name of the first
+        # central directory entry.
         data = (
             b'PK\x03\x04\x14\x00\x00\x00\x08\x00\xa0lH\x05\xe2\x1e'
             b'8\xbb\x10\x00\x00\x00\t\x04\x00\x00\x01\x00\x00\x00b\xed'
@@ -2457,6 +2468,10 @@ class OtherTests(unittest.TestCase):
 
     @requires_zlib()
     def test_full_overlap_different_names2(self):
+        # The ZIP file contains two central directory entries with
+        # different names which refer to the same local header.
+        # The name of the local header matches the name of the second
+        # central directory entry.
         data = (
             b'PK\x03\x04\x14\x00\x00\x00\x08\x00\xa0lH\x05\xe2\x1e'
             b'8\xbb\x10\x00\x00\x00\t\x04\x00\x00\x01\x00\x00\x00a\xed'
@@ -2488,6 +2503,8 @@ class OtherTests(unittest.TestCase):
 
     @requires_zlib()
     def test_full_overlap_same_name(self):
+        # The ZIP file contains two central directory entries with
+        # the same name which refer to the same local header.
         data = (
             b'PK\x03\x04\x14\x00\x00\x00\x08\x00\xa0lH\x05\xe2\x1e'
             b'8\xbb\x10\x00\x00\x00\t\x04\x00\x00\x01\x00\x00\x00a\xed'
@@ -2520,6 +2537,8 @@ class OtherTests(unittest.TestCase):
 
     @requires_zlib()
     def test_quoted_overlap(self):
+        # The ZIP file contains two files. The second local header
+        # is contained in the range of the first file.
         data = (
             b'PK\x03\x04\x14\x00\x00\x00\x08\x00\xa0lH\x05Y\xfc'
             b'8\x044\x00\x00\x00(\x04\x00\x00\x01\x00\x00\x00a\x00'
@@ -2551,6 +2570,7 @@ class OtherTests(unittest.TestCase):
 
     @requires_zlib()
     def test_overlap_with_central_dir(self):
+        # The local header offset is equal to the central directory offset.
         data = (
             b'PK\x01\x02\x14\x03\x14\x00\x00\x00\x08\x00G_|Z'
             b'\xe2\x1e8\xbb\x0b\x00\x00\x00\t\x04\x00\x00\x01\x00\x00\x00'
@@ -2565,11 +2585,15 @@ class OtherTests(unittest.TestCase):
             self.assertEqual(zi.header_offset, 0)
             self.assertEqual(zi.compress_size, 11)
             self.assertEqual(zi.file_size, 1033)
+            # Found central directory signature PK\x01\x02 instead of
+            # local header signature PK\x03\x04.
             with self.assertRaisesRegex(zipfile.BadZipFile, 'Bad magic number'):
                 zipf.read('a')
 
     @requires_zlib()
     def test_overlap_with_archive_comment(self):
+        # The local header is written after the central directory,
+        # in the archive comment.
         data = (
             b'PK\x01\x02\x14\x03\x14\x00\x00\x00\x08\x00G_|Z'
             b'\xe2\x1e8\xbb\x0b\x00\x00\x00\t\x04\x00\x00\x01\x00\x00\x00'
@@ -2593,6 +2617,110 @@ class OtherTests(unittest.TestCase):
     def tearDown(self):
         unlink(TESTFN)
         unlink(TESTFN2)
+
+
+class AbstractBoundedDecompressTests:
+    # ZipExtFile._read1() bounds the output of each decompress() call so that a
+    # small member declaring a large uncompressed size cannot expand into one
+    # unbounded read.
+    def test_read1_output_is_bounded(self):
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", compression=self.compression) as zf:
+            zf.writestr("big", b"\0" * (4 * 1024 * 1024))
+        with zipfile.ZipFile(io.BytesIO(buf.getvalue())) as zf:
+            with zf.open("big") as f:
+                self.assertLessEqual(len(f._read1(100)), f.MIN_READ_SIZE)
+
+
+class StoredBoundedDecompressTests(AbstractBoundedDecompressTests,
+                                   unittest.TestCase):
+    compression = zipfile.ZIP_STORED
+
+
+@requires_zlib()
+class DeflateBoundedDecompressTests(AbstractBoundedDecompressTests,
+                                    unittest.TestCase):
+    compression = zipfile.ZIP_DEFLATED
+
+
+@requires_bz2()
+class Bzip2BoundedDecompressTests(AbstractBoundedDecompressTests,
+                                  unittest.TestCase):
+    compression = zipfile.ZIP_BZIP2
+
+
+@requires_lzma()
+class LzmaBoundedDecompressTests(AbstractBoundedDecompressTests,
+                                 unittest.TestCase):
+    compression = zipfile.ZIP_LZMA
+
+
+
+class MonkeypatchedDecompressorTests(unittest.TestCase):
+    # Some third-party projects monkey-patch _get_decompressor() to add
+    # additional compression schemes. This can break at any time as the
+    # internal compressor objects change.
+    # To protect users, we try to keep this case working.
+    # See also: GH-156002 and GH-113767.
+    COMPRESSION = 99
+
+    class Compressor:
+        """Compressor with only the original BZ2Compressor API"""
+        def compress(self, data):
+            return data.swapcase()
+
+        def flush(self):
+            return b''
+
+    class Decompressor:
+        """Decompressor with only the 3.3+ BZ2Decompressor API"""
+        eof = False
+
+        def decompress(self, data):
+            return data.swapcase()
+
+    def setUp(self):
+        orig_check_compression = zipfile._check_compression
+        orig_get_compressor = zipfile._get_compressor
+        orig_get_decompressor = zipfile._get_decompressor
+
+        def check_compression(compression):
+            if compression != self.COMPRESSION:
+                orig_check_compression(compression)
+
+        def get_compressor(compress_type, compresslevel=None):
+            if compress_type == self.COMPRESSION:
+                return self.Compressor()
+            return orig_get_compressor(compress_type, compresslevel)
+
+        def get_decompressor(compress_type):
+            if compress_type == self.COMPRESSION:
+                return self.Decompressor()
+            return orig_get_decompressor(compress_type)
+
+        self.enterContext(mock.patch.object(
+            zipfile, '_check_compression', check_compression))
+        self.enterContext(mock.patch.object(
+            zipfile, '_get_compressor', get_compressor))
+        self.enterContext(mock.patch.object(
+            zipfile, '_get_decompressor', get_decompressor))
+
+    def test_roundtrip_monkeypatched_decompressor(self):
+        data = bytes(range(256)) * 8
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", compression=self.COMPRESSION) as zf:
+            zf.writestr("member", data)
+        self.assertIn(data.swapcase(), buf.getvalue())
+        with zipfile.ZipFile(io.BytesIO(buf.getvalue())) as zf:
+            self.assertEqual(zf.read("member"), data)
+            with zf.open("member") as f:
+                self.assertEqual(f.read(100), data[:100])
+                self.assertEqual(f.read1(100), data[100:200])
+                f.seek(-100, os.SEEK_END)
+                self.assertEqual(f.read(), data[-100:])
+                # Rewinding past the read buffer re-creates the decompressor.
+                f.seek(0)
+                self.assertEqual(f.read(), data)
 
 
 class AbstractBadCrcTests:
@@ -3504,29 +3632,23 @@ class EncodedMetadataTests(unittest.TestCase):
 
     def test_read_after_append(self):
         newname = '\u56db'  # Han 'four'
-        expected_names = [name.encode('shift_jis').decode('cp437')
-                          for name in self.file_names[:2]] + self.file_names[2:]
-        expected_names.append(newname)
-        expected_content = (*self.file_content, b"newcontent")
+        newname2 = 'fünf'  # representable in cp437, but still stored as UTF-8
+        expected_names = [*self.file_names, newname, newname2]
+        mojibake_expected_names = [name.encode('shift_jis').decode('cp437')
+                                   if i < 2 else name
+                                   for i, name in enumerate(expected_names)]
+        expected_content = (*self.file_content, b"newcontent", b"newcontent2")
 
         with zipfile.ZipFile(TESTFN, "a") as zipfp:
             zipfp.writestr(newname, "newcontent")
-            self.assertEqual(sorted(zipfp.namelist()), sorted(expected_names))
+            zipfp.writestr(newname2, "newcontent2")
+            self.assertEqual(sorted(zipfp.namelist()), sorted(mojibake_expected_names))
 
         with zipfile.ZipFile(TESTFN, "r") as zipfp:
-            self._test_read(zipfp, expected_names, expected_content)
+            self._test_read(zipfp, mojibake_expected_names, expected_content)
 
         with zipfile.ZipFile(TESTFN, "r", metadata_encoding='shift_jis') as zipfp:
-            self.assertEqual(sorted(zipfp.namelist()), sorted(expected_names))
-            for i, (name, content) in enumerate(zip(expected_names, expected_content)):
-                info = zipfp.getinfo(name)
-                self.assertEqual(info.filename, name)
-                self.assertEqual(info.file_size, len(content))
-                if i < 2:
-                    with self.assertRaises(zipfile.BadZipFile):
-                        zipfp.read(name)
-                else:
-                    self.assertEqual(zipfp.read(name), content)
+            self._test_read(zipfp, expected_names, expected_content)
 
     def test_write_with_metadata_encoding(self):
         ZF = zipfile.ZipFile
@@ -3534,6 +3656,20 @@ class EncodedMetadataTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError,
                                         "^metadata_encoding is only"):
                 ZF("nonesuch.zip", mode, metadata_encoding="shift_jis")
+
+    def test_add_comment(self):
+        with zipfile.ZipFile(TESTFN, "r") as zipfp:
+            mojibake_expected_names = zipfp.namelist()
+
+        with zipfile.ZipFile(TESTFN, "a") as zipfp:
+            zipfp.comment = b'comment'
+            self.assertEqual(zipfp.namelist(), mojibake_expected_names)
+
+        with zipfile.ZipFile(TESTFN, "r") as zipfp:
+            self._test_read(zipfp, mojibake_expected_names, self.file_content)
+
+        with zipfile.ZipFile(TESTFN, "r", metadata_encoding='shift_jis') as zipfp:
+            self._test_read(zipfp, self.file_names, self.file_content)
 
     def test_cli_with_metadata_encoding(self):
         errmsg = "Non-conforming encodings not supported with -c."

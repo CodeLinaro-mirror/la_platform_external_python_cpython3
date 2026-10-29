@@ -177,12 +177,10 @@ distinguished from a number.  Use :c:func:`PyErr_Occurred` to disambiguate.
 
    .. c:function:: long PyLong_AS_LONG(PyObject *obj)
 
-      A :term:`soft deprecated` alias.
       Exactly equivalent to the preferred ``PyLong_AsLong``. In particular,
       it can fail with :exc:`OverflowError` or another exception.
 
-      .. deprecated:: 3.14
-         The function is soft deprecated.
+      .. soft-deprecated:: 3.14
 
 .. c:function:: int PyLong_AsInt(PyObject *obj)
 
@@ -403,8 +401,8 @@ distinguished from a number.  Use :c:func:`PyErr_Occurred` to disambiguate.
 
    Otherwise, returns the number of bytes required to store the value.
    If this is equal to or less than *n_bytes*, the entire value was copied.
-   All *n_bytes* of the buffer are written: large buffers are padded with
-   zeroes.
+   All *n_bytes* of the buffer are written: remaining bytes filled by
+   copies of the sign bit.
 
    If the returned value is greater than *n_bytes*, the value was
    truncated: as many of the lowest bits of the value as could fit are written,

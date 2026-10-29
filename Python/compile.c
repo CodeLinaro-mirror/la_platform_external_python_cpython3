@@ -114,7 +114,7 @@ compiler IR.
 enum fblocktype { WHILE_LOOP, FOR_LOOP, TRY_EXCEPT, FINALLY_TRY, FINALLY_END,
                   WITH, ASYNC_WITH, HANDLER_CLEANUP, POP_VALUE, EXCEPTION_HANDLER,
                   EXCEPTION_GROUP_HANDLER, ASYNC_COMPREHENSION_GENERATOR,
-                  STOP_ITERATION };
+                  INLINED_COMPREHENSION, STOP_ITERATION };
 
 struct fblockinfo {
     enum fblocktype fb_type;
@@ -430,6 +430,7 @@ new_compiler(mod_ty mod, PyObject *filename, PyCompilerFlags *pflags,
 {
     struct compiler *c = PyMem_Calloc(1, sizeof(struct compiler));
     if (c == NULL) {
+        PyErr_NoMemory();
         return NULL;
     }
     if (compiler_setup(c, mod, filename, pflags, optimize, arena) < 0) {
@@ -1081,6 +1082,8 @@ codegen_addop_j(instr_sequence *seq, location loc,
     return _PyInstructionSequence_Addop(seq, opcode, target.id, loc);
 }
 
+static void compiler_exit_scope(struct compiler *c);
+
 #define RETURN_IF_ERROR_IN_SCOPE(C, CALL) { \
     if ((CALL) < 0) { \
         compiler_exit_scope((C)); \
@@ -1176,6 +1179,23 @@ codegen_addop_j(instr_sequence *seq, location loc,
     } \
 }
 
+
+static int
+codegen_init_new_scope(struct compiler *c, location loc)
+{
+    if (c->u->u_scope_type == COMPILER_SCOPE_MODULE) {
+        loc.lineno = 0;
+    }
+    else {
+        RETURN_IF_ERROR(compiler_set_qualname(c));
+    }
+    ADDOP_I(c, loc, RESUME, RESUME_AT_FUNC_START);
+
+    if (c->u->u_scope_type == COMPILER_SCOPE_MODULE) {
+        loc.lineno = -1;
+    }
+    return SUCCESS;
+}
 
 static int
 compiler_enter_scope(struct compiler *c, identifier name,
@@ -1287,17 +1307,7 @@ compiler_enter_scope(struct compiler *c, identifier name,
 
     c->c_nestlevel++;
 
-    if (u->u_scope_type == COMPILER_SCOPE_MODULE) {
-        loc.lineno = 0;
-    }
-    else {
-        RETURN_IF_ERROR(compiler_set_qualname(c));
-    }
-    ADDOP_I(c, loc, RESUME, RESUME_AT_FUNC_START);
-
-    if (u->u_scope_type == COMPILER_SCOPE_MODULE) {
-        loc.lineno = -1;
-    }
+    RETURN_IF_ERROR_IN_SCOPE(c, codegen_init_new_scope(c, loc));
     return SUCCESS;
 }
 
@@ -1522,6 +1532,7 @@ compiler_unwind_fblock(struct compiler *c, location *ploc,
         case EXCEPTION_HANDLER:
         case EXCEPTION_GROUP_HANDLER:
         case ASYNC_COMPREHENSION_GENERATOR:
+        case INLINED_COMPREHENSION:
         case STOP_ITERATION:
             return SUCCESS;
 
@@ -5713,8 +5724,10 @@ push_inlined_comprehension_state(struct compiler *c, location loc,
         NEW_JUMP_TARGET_LABEL(c, end);
         state->end = end;
 
-        // no need to push an fblock for this "virtual" try/finally; there can't
-        // be return/continue/break inside a comprehension
+        // Count against CO_MAXBLOCKS: SETUP_FINALLY consumes an except-stack
+        // slot even though return/continue/break cannot appear here.
+        RETURN_IF_ERROR(compiler_push_fblock(c, loc, INLINED_COMPREHENSION,
+                                             cleanup, NO_LABEL, NULL));
         ADDOP_JUMP(c, loc, SETUP_FINALLY, cleanup);
     }
 
@@ -5760,6 +5773,7 @@ pop_inlined_comprehension_state(struct compiler *c, location loc,
     }
     if (state.pushed_locals) {
         ADDOP(c, NO_LOCATION, POP_BLOCK);
+        compiler_pop_fblock(c, INLINED_COMPREHENSION, state.cleanup);
         ADDOP_JUMP(c, NO_LOCATION, JUMP_NO_INTERRUPT, state.end);
 
         // cleanup from an exception inside the comprehension
@@ -7844,6 +7858,7 @@ _PyCompile_CodeGen(PyObject *ast, PyObject *filename, PyCompilerFlags *pflags,
 {
     PyObject *res = NULL;
     PyObject *metadata = NULL;
+    PyObject *consts_list = NULL;
 
     if (!PyAST_Check(ast)) {
         PyErr_SetString(PyExc_TypeError, "expected an AST");
@@ -7870,7 +7885,7 @@ _PyCompile_CodeGen(PyObject *ast, PyObject *filename, PyCompilerFlags *pflags,
 
     metadata = PyDict_New();
     if (metadata == NULL) {
-        return NULL;
+        goto finally;
     }
 
     if (compiler_enter_anonymous_scope(c, mod) < 0) {
@@ -7889,7 +7904,6 @@ _PyCompile_CodeGen(PyObject *ast, PyObject *filename, PyCompilerFlags *pflags,
 
     SET_MATADATA_ITEM("name", umd->u_name);
     SET_MATADATA_ITEM("qualname", umd->u_qualname);
-    SET_MATADATA_ITEM("consts", umd->u_consts);
     SET_MATADATA_ITEM("names", umd->u_names);
     SET_MATADATA_ITEM("varnames", umd->u_varnames);
     SET_MATADATA_ITEM("cellvars", umd->u_cellvars);
@@ -7915,14 +7929,26 @@ _PyCompile_CodeGen(PyObject *ast, PyObject *filename, PyCompilerFlags *pflags,
     }
 
     if (_PyInstructionSequence_ApplyLabelMap(INSTR_SEQUENCE(c)) < 0) {
-        return NULL;
+        goto finally;
+    }
+    /* After add_return_at_end: const indices match final instruction stream. */
+    consts_list = consts_dict_keys_inorder(umd->u_consts);
+    if (consts_list == NULL) {
+        goto finally;
+    }
+    if (PyDict_SetItemString(metadata, "consts", consts_list) < 0) {
+        goto finally;
     }
     /* Allocate a copy of the instruction sequence on the heap */
     res = PyTuple_Pack(2, INSTR_SEQUENCE(c), metadata);
 
 finally:
+    Py_XDECREF(consts_list);
     Py_XDECREF(metadata);
     compiler_exit_scope(c);
+    if (c->u != NULL) {
+        compiler_exit_scope(c);
+    }
     compiler_free(c);
     _PyArena_Free(arena);
     return res;
@@ -7933,6 +7959,10 @@ _PyCompile_OptimizeCfg(PyObject *seq, PyObject *consts, int nlocals)
 {
     if (!_PyInstructionSequence_Check(seq)) {
         PyErr_SetString(PyExc_ValueError, "expected an instruction sequence");
+        return NULL;
+    }
+    if (!PyList_Check(consts)) {
+        PyErr_SetString(PyExc_TypeError, "consts must be a list");
         return NULL;
     }
     PyObject *const_cache = PyDict_New();

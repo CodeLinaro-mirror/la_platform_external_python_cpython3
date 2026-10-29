@@ -1782,7 +1782,7 @@ sys_getwindowsversion_impl(PyObject *module)
     PyObject *realVersion = _sys_getwindowsversion_from_kernel32();
     if (!realVersion) {
         if (!PyErr_ExceptionMatches(PyExc_WindowsError)) {
-            return NULL;
+            goto error;
         }
 
         PyErr_Clear();
@@ -2329,12 +2329,13 @@ sys._stats_dump -> bool
 
 Dump stats to file, and clears the stats.
 
-Return False if no statistics were not dumped because stats gathering was off.
+Return False if no statistics were not dumped because stats gathering
+was off.
 [clinic start generated code]*/
 
 static int
 sys__stats_dump_impl(PyObject *module)
-/*[clinic end generated code: output=6e346b4ba0de4489 input=31a489e39418b2a5]*/
+/*[clinic end generated code: output=6e346b4ba0de4489 input=7f3b7758cb59d2ff]*/
 {
     int res = _Py_PrintSpecializationStats(1);
     _Py_StatsClear();
@@ -2609,20 +2610,31 @@ PyAPI_FUNC(int) PyUnstable_CopyPerfMapFile(const char* parent_filename) {
     }
     char buf[4096];
     PyThread_acquire_lock(perf_map_state.map_lock, 1);
-    int fflush_result = 0, result = 0;
+    int result = 0;
     while (1) {
         size_t bytes_read = fread(buf, 1, sizeof(buf), from);
-        size_t bytes_written = fwrite(buf, 1, bytes_read, perf_map_state.perf_map);
-        fflush_result = fflush(perf_map_state.perf_map);
-        if (fflush_result != 0 || bytes_read == 0 || bytes_written < bytes_read) {
-            result = -1;
-            goto close_and_release;
+        if (bytes_read == 0) {
+            if (ferror(from)) {
+                result = -1;
+            }
+            break;
         }
+
+        size_t bytes_written = fwrite(buf, 1, bytes_read, perf_map_state.perf_map);
+        if (bytes_written < bytes_read) {
+            result = -1;
+            break;
+        }
+
+        if (fflush(perf_map_state.perf_map) != 0) {
+            result = -1;
+            break;
+        }
+
         if (bytes_read < sizeof(buf) && feof(from)) {
-            goto close_and_release;
+            break;
         }
     }
-close_and_release:
     fclose(from);
     PyThread_release_lock(perf_map_state.map_lock);
     return result;

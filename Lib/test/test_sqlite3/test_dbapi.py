@@ -509,6 +509,13 @@ class ConnectionTests(unittest.TestCase):
                     cx.isolation_level = level
                     self.assertEqual(cx.isolation_level, level)
 
+    def test_connection_delete_isolation_level(self):
+        with memory_database() as cx:
+            with self.assertRaisesRegex(AttributeError,
+                                        "cannot delete attribute"):
+                del cx.isolation_level
+            self.assertEqual(cx.isolation_level, "")
+
     def test_connection_reinit(self):
         with memory_database() as cx:
             cx.text_factory = bytes
@@ -1106,9 +1113,16 @@ class CursorTests(unittest.TestCase):
         UINT32_MAX = (1 << 32) - 1
         setter = functools.partial(setattr, self.cu, 'arraysize')
 
+        self.cu.arraysize = 2
         self.assertRaises(TypeError, setter, 1.0)
         self.assertRaises(ValueError, setter, -3)
         self.assertRaises(OverflowError, setter, UINT32_MAX + 1)
+        self.assertRaises(OverflowError, setter, 2**1000)
+        self.assertRaises(ValueError, setter, -2**1000)
+        self.assertRaisesRegex(AttributeError, 'cannot be deleted',
+                               delattr, self.cu, 'arraysize')
+        # a failed assignment does not change the value
+        self.assertEqual(self.cu.arraysize, 2)
 
     def test_fetchmany(self):
         # no active SQL statement
@@ -1410,6 +1424,11 @@ class BlobTests(unittest.TestCase):
     def test_blob_get_empty_slice(self):
         self.assertEqual(self.blob[5:5], b"")
 
+    def test_blob_get_empty_slice_oob_indices(self):
+        self.cx.execute("insert into test(b) values (?)", (b"abc",))
+        with self.cx.blobopen("test", "b", 2) as blob:
+            self.assertEqual(blob[5:-5], b"")
+
     def test_blob_get_slice_negative_index(self):
         self.assertEqual(self.blob[5:-5], self.data[5:-5])
 
@@ -1424,6 +1443,18 @@ class BlobTests(unittest.TestCase):
 
     def test_blob_set_empty_slice(self):
         self.blob[0:0] = b""
+        self.assertEqual(self.blob[:], self.data)
+
+    def test_blob_set_empty_slice_wrong_type(self):
+        with self.assertRaises(TypeError):
+            self.blob[5:5] = None
+
+    def test_blob_set_empty_slice_wrong_size(self):
+        with self.assertRaisesRegex(IndexError, "wrong size"):
+            self.blob[5:5] = b"123"
+
+    def test_blob_set_empty_slice_correct(self):
+        self.blob[5:5] = b""
         self.assertEqual(self.blob[:], self.data)
 
     def test_blob_set_slice_with_skip(self):
