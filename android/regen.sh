@@ -40,7 +40,7 @@ export CLANG_VERSION=$(cd $ANDROID_BUILD_TOP; build/soong/scripts/get_clang_vers
 if [ $DIR == "linux_x86_64" ]; then
   export CC="$ANDROID_BUILD_TOP/prebuilts/clang/host/linux-x86/$CLANG_VERSION/bin/clang"
   export CFLAGS="--sysroot=$ANDROID_BUILD_TOP/prebuilts/gcc/linux-x86/host/x86_64-linux-glibc2.17-4.8/sysroot"
-  export LDFLAGS="--sysroot=$ANDROID_BUILD_TOP/prebuilts/gcc/linux-x86/host/x86_64-linux-glibc2.17-4.8/sysroot -B$ANDROID_BUILD_TOP/prebuilts/gcc/linux-x86/host/x86_64-linux-glibc2.17-4.8/lib/gcc/x86_64-linux/4.8.3 -L$ANDROID_BUILD_TOP/prebuilts/gcc/linux-x86/host/x86_64-linux-glibc2.17-4.8/lib/gcc/x86_64-linux/4.8.3 -L$ANDROID_BUILD_TOP/prebuilts/gcc/linux-x86/host/x86_64-linux-glibc2.17-4.8/x86_64-linux/lib64"
+  export LDFLAGS="--sysroot=$ANDROID_BUILD_TOP/prebuilts/gcc/linux-x86/host/x86_64-linux-glibc2.17-4.8/sysroot -B$ANDROID_BUILD_TOP/prebuilts/gcc/linux-x86/host/x86_64-linux-glibc2.17-4.8/lib/gcc/x86_64-linux/4.8.3 -L$ANDROID_BUILD_TOP/prebuilts/gcc/linux-x86/host/x86_64-linux-glibc2.17-4.8/lib/gcc/x86_64-linux/4.8.3 -L$ANDROID_BUILD_TOP/prebuilts/gcc/linux-x86/host/x86_64-linux-glibc2.17-4.8/x86_64-linux/lib64 --rtlib=compiler-rt -fuse-ld=lld"
 elif [ $DIR == "linux_arm64" ]; then
   #export CC="$ANDROID_BUILD_TOP/prebuilts/clang/host/linux-x86/$CLANG_VERSION/bin/clang"
   export CC=clang
